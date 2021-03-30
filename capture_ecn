@@ -1,0 +1,295 @@
+#!/bin/ksh
+
+function show_help {
+    echo "Usage: $0 [-s] [-l]"
+    echo ""
+    echo "  -s:     do not perform SYSCTRLs to enforce ECN"
+    echo "  -l:     do not filter local to local traffic from results"
+    echo "  -v:     be verbose and print additional information to stderr"
+}
+
+filter_local_to_local=1
+no_sysctrl=0
+verbose=0
+while getopts "h?fsv" opt
+do
+    case "$opt" in
+        h|\?)
+            show_help
+            exit 0
+            ;;
+        l) filter_local_to_local=0
+            ;;
+        s) no_sysctrl=1
+            ;;
+        v) verbose=1
+            ;;
+    esac
+done   
+
+
+if [ ${no_sysctrl} -eq 0 ]
+then
+    # use ecn on outgoing traffic
+    sysctl -w net.inet.tcp.ecn_initiate_out=2 1>&2
+
+    # disable tcp heuristics to enforce using ecn all the time
+    # see tcp_output.c (line 499 - 500)
+    sysctl -w net.inet.tcp.disable_tcp_heuristics=1 1>&2
+
+    # already defaults to 100
+    # sysctl -w net.inet.tcp.ecn_setup_percentage=100
+fi
+
+/usr/sbin/dtrace -s <(
+cat << "EOF"
+
+#pragma D option quiet
+#pragma D option switchrate=10hz
+
+inline int AF_INET6 = 30;
+inline int AF_INET = 2;
+
+
+inline int CMD_FLUSH = 0;
+inline int CMD_ESTABLISHED_FLAGS = 1;
+inline int CMD_IP_ECN = 2;
+inline int CMD_TCP_ECN = 3;
+inline int CMD_FAILED_CONNECT = 4;
+
+tcp:::state-change
+/args[3]->tcps_state == "state-established"/   // track successfull ecn establishment
+{
+    //ipcb = args[1];
+    //tcp =    args[2];
+    //printf("FLOW -1 SRC STATE_CHANGE:%s\n",args[1]->ip_saddr);
+    // saddr = own address, daddr = remote address
+
+    // dump ecn flags
+    printf("%s,%d,%s,%d %d %d\n", args[1]->ip_daddr, args[1]->dport, args[1]->ip_saddr, args[1]->sport, CMD_ESTABLISHED_FLAGS, args[2]->tcpcb->ecn_flags)
+    
+}
+
+// transition from SYN-SENT to CLOSE (aka conn failed)
+tcp:::state-change
+/args[2]->tcps_state == "state-syn-sent" && args[3]->tcps_state == "state-closed"/
+{
+    // saddr = own address, daddr = remote address
+
+    printf("%s,%d,%s,%d %d %d\n", args[1]->ip_daddr, args[1]->dport, args[1]->ip_saddr, args[1]->sport, CMD_FAILED_CONNECT, args[2]->tcpcb->ecn_flags)
+}
+
+// connection closed (or is about to close)
+tcp:::state-change
+/args[3]->tcps_state == "state-closed" || args[3]->tcps_state == "state-time-wait"/
+{
+    // saddr = own address, daddr = remote address
+    
+    printf("%s,%d,%s,%d %d %d\n", args[1]->ip_daddr, args[1]->dport, args[1]->ip_saddr, args[1]->sport, CMD_FLUSH, args[2]->tcpcb->ecn_flags)
+}
+
+// always called for every packet and packet access has happend, so it must be mapped
+// tcp_input.c (line 6637): tcp_input_checksum(int af, struct mbuf *m, struct tcphdr *th, int off, int tlen)
+fbt::tcp_input_checksum:entry
+{        
+    if (args[1] == NULL) {
+        printf("FLOW -1 Packet buffer was NULL\n");
+    }
+    if (args[2] == NULL) {
+        printf("FLOW -1 TCP header buffer was NULL\n");
+    }
+
+    // get ECN flags from v4/v6 header
+    if (args[0] == AF_INET6) {
+        if (args[1]->m_hdr.mh_data == 0) {
+            printf("FLOW -1 tcp_input_v6_was_zero\n")
+        }
+        v6 = xlate<ipv6info_t> ((struct ip6_hdr*)args[1]->m_hdr.mh_data);
+        ip_saddr = v6.ipv6_saddr;
+        ip_daddr = v6.ipv6_daddr;
+        ip_ecn = v6.ipv6_tclass & 0x03;
+    }else { //AF_INET
+        v4 = xlate<ipv4info_t> ((struct ip*)args[1]->m_hdr.mh_data);
+        ip_saddr = v4.ipv4_saddr;
+        ip_daddr = v4.ipv4_daddr;
+        
+        ip_ecn = v4.ipv4_tos & 0x03;
+    }
+
+    tcp = xlate<tcpinfo_t>(args[2]);
+    has_tcp_ece = (tcp.tcp_flags & TH_ECE) > 0 ? 1 : 0;
+    has_tcp_cwr = (tcp.tcp_flags & TH_CWR) > 0 ? 1 : 0;
+    tcp_sport = tcp.tcp_sport;
+    tcp_dport = tcp.tcp_dport;
+
+    // saddr = remote address, daddr = own address
+    if (ip_ecn > 0) {
+        printf("%s,%d,%s,%d %d %d\n", ip_saddr, tcp_sport, ip_daddr, tcp_dport, CMD_IP_ECN, ip_ecn)
+    }
+    if (has_tcp_ece) {
+        printf("%s,%d,%s,%d %d %s\n", ip_saddr, tcp_sport, ip_daddr, tcp_dport, CMD_TCP_ECN, "TCP_ECE")
+    }
+    if (has_tcp_cwr) {
+        printf("%s,%d,%s,%d %d %s\n", ip_saddr, tcp_sport, ip_daddr, tcp_dport, CMD_TCP_ECN, "TCP_CWR")
+    }
+    
+}
+
+ERROR
+{
+    //printf("FLOW -1 DTRACEFLT_UNKNOWN: %d, DTRACEFLT_BADADDR: %d DTRACEFLT_BADALIGN: %d\n", DTRACEFLT_UNKNOWN, DTRACEFLT_BADADDR, DTRACEFLT_BADALIGN);
+    printf("FLOW -1 Error EPID:%d index:%d, offset:%d fault:%d fault_value:%d\n", arg1, arg2, arg3, arg4, arg5);
+}
+
+dtrace:::END
+{
+
+}
+EOF
+) | python3 <(
+cat << 'EOF'
+#!/usr/bin/env python3
+
+import sys
+import ipaddress
+import json
+
+filter_local_to_local=int(sys.argv[1]) == 1
+verbose=int(sys.argv[2]) == 1
+
+CMD_FLUSH = 0
+CMD_ESTABLISHED_FLAGS = 1
+CMD_IP_ECN = 2
+CMD_TCP_ECN = 3
+CMD_FAILED_CONNECT = 4
+
+# from netinet/tcp_var.h
+TE_SETUPSENT =           0x0001  # Indicate we have sent ECN-SETUP SYN or SYN-ACK 
+TE_SETUPRECEIVED =       0x0002  # Indicate we have received ECN-SETUP SYN or SYN-ACK 
+TE_SENDIPECT      =      0x0004  # Indicate we havent sent or received non-ECN-setup SYN or SYN-ACK 
+TE_SENDCWR         =     0x0008  # Indicate that the next non-retransmit should have the TCP CWR flag set
+TE_SENDECE          =    0x0010  # Indicate that the next packet should have the TCP ECE flag set 
+TE_INRECOVERY   =        0x0020  # connection entered recovery after receiving ECE 
+TE_RECV_ECN_CE   =       0x0040  # Received IPTOS_ECN_CE marking atleast once 
+TE_RECV_ECN_ECE   =      0x0080  # Received ECE marking atleast once 
+TE_LOST_SYN        =     0x0100  # Lost SYN with ECN setup 
+TE_LOST_SYNACK      =    0x0200  # Lost SYN-ACK with ECN setup 
+TE_ECN_MODE_ENABLE   =   0x0400  # Option ECN mode set to enable 
+TE_ECN_MODE_DISABLE   =  0x0800  # Option ECN mode set to disable 
+TE_ENABLE_ECN  =         0x1000  # Enable negotiation of ECN 
+TE_ECN_ON       =        (TE_SETUPSENT | TE_SETUPRECEIVED) # Indicate ECN was successfully negotiated on a connection) 
+TE_CEHEURI_SET   =       0x2000  # We did our CE-probing at the beginning 
+TE_CLIENT_SETUP   =      0x4000  # setup from client side 
+TE_RCVD_SYN_RST    =     0x8000  # Received RST to the first ECN enabled SYN 
+
+
+IP_ECN_ECT1 = 0x01
+IP_ECN_ECT0 = 0x02
+IP_ECN_CE = 0x03
+
+ecn = {}
+#print("src_ip,src_port,dst_ip,dst_port,ecn_on,ecn_setup_req,ecn_setup_recv,num_ce_recv,num_ect0_recv,num_ect1_recv,num_tcp_ece_recv,num_tcp_cwr_recv", flush=True)
+
+for line in sys.stdin:
+    try:
+        flow, cmd, arg = line.strip().split(" ", maxsplit=2)
+        dst_addr, dst_port, src_addr, src_port = flow.split(",", maxsplit=3)
+        if filter_local_to_local:
+            dst_ip = ipaddress.ip_address(dst_addr)
+            if not dst_ip.is_global:  # this filters all non-global traffic
+                if verbose:
+                    print(f"Ignoring non-global flow: {flow}", file=sys.stderr)
+                continue
+
+            # this does not filter global traffic that is actually local (which I do get and this does not help me for ECN eval)
+            # without accessing the actual interfaces make some guesses about the network and filter global to global from the same
+            # guessed  network prefix
+            if dst_ip.version == 4:
+                src_net = ipaddress.ip_network(f"{src_addr}/24", strict=False)
+                dst_net = ipaddress.ip_network(f"{dst_addr}/32", strict=False)
+            else:
+                src_net = ipaddress.ip_network(f"{src_addr}/64", strict=False)
+                dst_net = ipaddress.ip_network(f"{dst_addr}/128", strict=False)
+            if src_net.overlaps(dst_net):
+                if verbose:
+                    print(f"Ignoring global to global flow that seems to be local: {flow}", file=sys.stderr)
+                continue
+            
+
+    except Exception as e:
+        print(f"Error on line: {line} {e}", file=sys.stderr)
+        continue
+    cmd = int(cmd)
+    #print(f"Flow: {flow} cmd: {cmd}, arg: {arg}", file=sys.stderr)
+    if (cmd == -1):
+        print(f"DEBUG: {arg}", file=sys.stderr)
+        continue
+
+
+    # track only flows that have been established or failed to establish while we listened in
+    if (cmd == CMD_ESTABLISHED_FLAGS or cmd == CMD_FAILED_CONNECT) and flow not in ecn:
+        ecn[flow] = (False, False, False, False, False, 0, 0, 0, 0, 0, 0)
+    
+    if flow not in ecn:
+        continue
+
+    saw_est, ecn_on, ecn_setup_req, ecn_setup_recv, ecn_syn_lost, num_ce, num_ect0, num_ect1, num_tcp_ece, num_tcp_cwr, est_tcp_ecn = ecn[flow]
+    if (cmd == CMD_FLUSH):
+        # should we update ECN state? arg is ecn_flags
+        ecn_flags = int(arg)
+        close_tcp_ecn = ecn_flags
+        daddr, dport, saddr, sport = flow.split(",")
+        dport = int(dport)
+        sport = int(sport)
+        print(json.dumps({"daddr": daddr, "dport": dport, "saddr": saddr, "sport": sport, "established": saw_est, "ecn_on": ecn_on, "ecn_setup_req": ecn_setup_req, "ecn_setup_recv": ecn_setup_recv, "ecn_syn_lost": ecn_syn_lost, "ce": num_ce, "ect0": num_ect0, "ect1": num_ect1, "tcp_ece": num_tcp_ece, "tcp_cwr": num_tcp_cwr, "tcp_initial_ecn_state": est_tcp_ecn, "tcp_close_ecn_state": close_tcp_ecn}), flush=True)
+        
+        del ecn[flow]
+        continue
+
+    if (cmd == CMD_FAILED_CONNECT):
+        saw_est = False
+        ecn_flags = int(arg)
+        est_tcp_ecn = ecn_flags
+        ecn_on = (ecn_flags & TE_ECN_ON) == TE_ECN_ON
+        ecn_setup_req = (ecn_flags & TE_SETUPSENT) == TE_SETUPSENT
+        ecn_setup_recv = (ecn_flags & TE_SETUPRECEIVED) == TE_SETUPRECEIVED
+        ecn_syn_lost = (ecn_flags & TE_LOST_SYN) == TE_LOST_SYN
+
+    if (cmd == CMD_ESTABLISHED_FLAGS):
+        saw_est = True
+        ecn_flags = int(arg)
+        est_tcp_ecn = ecn_flags
+        ecn_on = (ecn_flags & TE_ECN_ON) == TE_ECN_ON
+        ecn_setup_req = (ecn_flags & TE_SETUPSENT) == TE_SETUPSENT
+        ecn_setup_recv = (ecn_flags & TE_SETUPRECEIVED) == TE_SETUPRECEIVED
+        ecn_syn_lost = (ecn_flags & TE_LOST_SYN) == TE_LOST_SYN
+        # what other flags do we care about?
+
+    elif (cmd == CMD_IP_ECN):
+        ip_ecn = int(arg)
+        if ip_ecn == IP_ECN_CE:
+            num_ce += 1
+        elif ip_ecn == IP_ECN_ECT0:
+            num_ect0 += 1
+        elif ip_ecn == IP_ECN_ECT1:
+            num_ect1 += 1
+
+    elif (cmd == CMD_TCP_ECN):
+        if arg == "TCP_ECE":
+            num_tcp_ece += 1
+        elif arg == "TCP_CWR":
+            num_tcp_cwr += 1
+        else:
+            print(f"Unknown arg for CMD 2: {arg}", file=sys.stderr)
+
+
+    #if verbose:
+        #print(f"Storing {ecn_on},{ecn_setup_req},{ecn_setup_recv},{num_ce},{num_ect0},{num_ect1},{num_tcp_ece},{num_tcp_cwr}", file=sys.stderr)
+
+    ecn[flow] = (saw_est, ecn_on, ecn_setup_req, ecn_setup_recv, ecn_syn_lost,
+                 num_ce, num_ect0, num_ect1, num_tcp_ece, num_tcp_cwr, est_tcp_ecn)
+    #if verbose:
+        #print(f"Stored {flow}: {ecn[flow]}", file=sys.stderr)
+EOF
+) ${filter_local_to_local} ${verbose}
+
